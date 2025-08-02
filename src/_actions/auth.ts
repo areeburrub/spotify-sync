@@ -1,7 +1,9 @@
 "use server";
 
 import { redirect } from "next/navigation";
+import { cookies } from "next/headers";
 import { PrismaClient } from "@/src/generated/prisma";
+import { signJWT } from "@/lib/jwt";
 
 const prisma = new PrismaClient();
 
@@ -107,6 +109,25 @@ export async function handleSpotifyCallback(code: string, state: string) {
         refreshToken: tokens.refresh_token,
         expiresAt: expiresAt
       }
+    });
+
+    const sessionData = {
+      id: user.id,
+      email: user.email || '',
+      name: user.name || '',
+      displayName: user.displayName || '',
+      spotifyId: user.spotifyId,
+      image: user.image || undefined
+    };
+
+    const token = signJWT(sessionData);
+    
+    const cookieStore = await cookies();
+    cookieStore.set('session', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge: 60 * 60 * 24 * 7 // 7 days
     });
 
     return user;
