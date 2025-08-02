@@ -10,6 +10,8 @@ interface Room {
   adminId: string
   isActive: boolean
   createdAt: string
+  isUserMember?: boolean
+  isUserAdmin?: boolean
   admin: {
     name: string
     image?: string
@@ -98,10 +100,18 @@ export default function RoomsPage() {
       })
 
       if (response.ok) {
+        // Refresh rooms list to show updated membership status
+        await fetchRooms()
+        // Then navigate to the room
         router.push(`/rooms/${roomId}`)
+      } else {
+        const errorData = await response.json()
+        console.error('Failed to join room:', errorData.error)
+        alert('Failed to join room: ' + (errorData.error || 'Unknown error'))
       }
     } catch (error) {
       console.error('Error joining room:', error)
+      alert('Failed to join room. Please try again.')
     }
   }
 
@@ -206,14 +216,25 @@ export default function RoomsPage() {
               {rooms.map((room) => (
                 <div
                   key={room.id}
-                  className="bg-gradient-to-br from-purple-900/40 to-purple-800/40 border border-purple-700/50 rounded-xl p-6 backdrop-blur-sm hover:border-purple-600/50 transition-colors cursor-pointer"
-                  onClick={() => router.push(`/rooms/${room.id}`)}
+                  className="bg-gradient-to-br from-purple-900/40 to-purple-800/40 border border-purple-700/50 rounded-xl p-6 backdrop-blur-sm hover:border-purple-600/50 transition-colors"
                 >
                   <div className="flex items-center justify-between mb-4">
                     <h3 className="text-lg font-semibold text-white truncate">{room.name}</h3>
-                    <span className="bg-green-500 text-white text-xs px-2 py-1 rounded-full">
-                      Active
-                    </span>
+                    <div className="flex items-center gap-2">
+                      {room.isUserAdmin && (
+                        <span className="bg-purple-600 text-white text-xs px-2 py-1 rounded-full">
+                          Your Room
+                        </span>
+                      )}
+                      {room.isUserMember && !room.isUserAdmin && (
+                        <span className="bg-blue-500 text-white text-xs px-2 py-1 rounded-full">
+                          Joined
+                        </span>
+                      )}
+                      <span className="bg-green-500 text-white text-xs px-2 py-1 rounded-full">
+                        Active
+                      </span>
+                    </div>
                   </div>
                   
                   <div className="space-y-3">
@@ -236,6 +257,36 @@ export default function RoomsPage() {
                     
                     <div className="text-purple-400 text-xs">
                       Created {new Date(room.createdAt).toLocaleDateString()}
+                    </div>
+
+                    {/* Action Buttons */}
+                    <div className="flex gap-2 mt-4">
+                      {room.isUserMember ? (
+                        <button
+                          onClick={() => router.push(`/rooms/${room.id}`)}
+                          className="flex-1 bg-purple-600 hover:bg-purple-700 text-white py-2 px-4 rounded-lg transition-colors duration-200 text-sm font-medium"
+                        >
+                          {room.isUserAdmin ? 'Manage Room' : 'Enter Room'}
+                        </button>
+                      ) : (
+                        <>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              joinRoom(room.id)
+                            }}
+                            className="flex-1 bg-green-600 hover:bg-green-700 text-white py-2 px-4 rounded-lg transition-colors duration-200 text-sm font-medium"
+                          >
+                            Join Room
+                          </button>
+                          <button
+                            onClick={() => router.push(`/rooms/${room.id}`)}
+                            className="bg-gray-600 hover:bg-gray-700 text-white py-2 px-4 rounded-lg transition-colors duration-200 text-sm font-medium"
+                          >
+                            Preview
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 </div>

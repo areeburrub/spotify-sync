@@ -70,16 +70,6 @@ export async function GET() {
 
     const rooms = await prisma.room.findMany({
       where: {
-        OR: [
-          { adminId: user.id },
-          { 
-            members: {
-              some: {
-                userId: user.id
-              }
-            }
-          }
-        ],
         isActive: true
       },
       include: {
@@ -93,7 +83,14 @@ export async function GET() {
       orderBy: { createdAt: 'desc' }
     })
 
-    return NextResponse.json(rooms)
+    // Add user membership status to each room
+    const roomsWithMembershipStatus = rooms.map(room => ({
+      ...room,
+      isUserMember: room.members.some(member => member.userId === user.id),
+      isUserAdmin: room.adminId === user.id
+    }))
+
+    return NextResponse.json(roomsWithMembershipStatus)
   } catch (error) {
     console.error('Error fetching rooms:', error)
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
