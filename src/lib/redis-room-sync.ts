@@ -1,38 +1,12 @@
 import { Redis } from '@upstash/redis'
 
-interface RoomSyncData {
-  roomCode: string
-  ownerId: string
-  currentTrack?: {
-    uri: string
-    id: string
-    name: string
-    artist: string
-    duration: number
-  }
-  playbackState: {
-    isPlaying: boolean
-    position: number // in milliseconds
-    timestamp: number // Unix timestamp when position was recorded
-    volume: number
-  }
-  lastUpdated: number // Unix timestamp
+interface HostSyncData {
+  SH: number // Host seek position in milliseconds
+  TH: number // Host unix timestamp
+  RH: number | null // Host round trip time (null initially)
+  isPlaying: boolean
 }
 
-interface MemberLatency {
-  userId: string
-  latency: number // in milliseconds
-  lastPing: number // Unix timestamp
-}
-
-interface RoomMembers {
-  [userId: string]: {
-    displayName: string
-    isOnline: boolean
-    lastSeen: number
-    deviceId?: string
-  }
-}
 
 // Initialize Redis client (reuse from oauth store)
 const redis = new Redis({
@@ -41,264 +15,92 @@ const redis = new Redis({
 })
 
 const ROOM_SYNC_PREFIX = 'room:sync:'
-const ROOM_MEMBERS_PREFIX = 'room:members:'
-const ROOM_LATENCY_PREFIX = 'room:latency:'
 const ROOM_TTL = 86400 // 24 hours in seconds
 
 /**
- * Store room synchronization data in Redis
+ * Store host sync data (SH, TH, RH)
  */
-export async function storeRoomSyncData(roomCode: string, syncData: RoomSyncData): Promise<void> {
+export async function storeHostSyncData(
+  roomCode: string, 
+  SH: number, 
+  isPlaying: boolean, 
+  RH: number | null = null
+): Promise<void> {
   try {
+    const syncData: HostSyncData = {
+      SH,
+      TH: Date.now(),
+      RH,
+      isPlaying
+    }
+    
     const key = `${ROOM_SYNC_PREFIX}${roomCode}`
     await redis.set(key, syncData, { ex: ROOM_TTL })
     
-    console.log('Stored room sync data:', roomCode)
+    console.log(`Stored host sync: SH=${SH}ms, TH=${syncData.TH}, RH=${RH}`)
   } catch (error) {
-    console.error('Failed to store room sync data:', error)
+    console.error('Failed to store host sync data:', error)
     throw error
   }
 }
 
 /**
- * Get room synchronization data from Redis
+ * Get host sync data from Redis
  */
-export async function getRoomSyncData(roomCode: string): Promise<RoomSyncData | null> {
+export async function getHostSyncData(roomCode: string): Promise<HostSyncData | null> {
   try {
     const key = `${ROOM_SYNC_PREFIX}${roomCode}`
-    const syncData = await redis.get<RoomSyncData>(key)
+    const syncData = await redis.get<HostSyncData>(key)
     
     if (!syncData) {
-      console.log('Room sync data not found:', roomCode)
       return null
     }
     
-    console.log('Retrieved room sync data:', roomCode)
     return syncData
   } catch (error) {
-    console.error('Failed to get room sync data:', error)
+    console.error('Failed to get host sync data:', error)
     return null
   }
 }
 
-/**
- * Update playback position for a room
- */
-export async function updateRoomPlayback(
-  roomCode: string, 
-  position: number, 
-  isPlaying: boolean,
-  timestamp?: number
-): Promise<void> {
-  try {
-    const currentData = await getRoomSyncData(roomCode)
-    if (!currentData) {
-      throw new Error('Room not found')
-    }
-
-    const updatedData: RoomSyncData = {
-      ...currentData,
-      playbackState: {
-        ...currentData.playbackState,
-        position,
-        isPlaying,
-        timestamp: timestamp || Date.now()
-      },
-      lastUpdated: Date.now()
-    }
-
-    await storeRoomSyncData(roomCode, updatedData)
-  } catch (error) {
-    console.error('Failed to update room playback:', error)
-    throw error
-  }
-}
 
 /**
- * Calculate synchronized position based on latency
+ * Calculate member's adjusted seek based on host data and member timing
  */
-export function calculateSyncedPosition(
-  recordedPosition: number,
-  recordedTimestamp: number,
-  isPlaying: boolean,
-  userLatency: number = 0
+export function calculateMemberSeek(
+  hostData: HostSyncData,
+  TM: number, // Member's current time 
+  RM: number  // Member's round trip time
 ): number {
-  if (!isPlaying) {
-    return recordedPosition
+  if (!hostData.isPlaying) {
+    return hostData.SH
   }
-
-  const now = Date.now()
-  const timeDiff = now - recordedTimestamp
-  const adjustedTimeDiff = Math.max(0, timeDiff - userLatency)
   
-  return recordedPosition + adjustedTimeDiff
+  // Calculate time difference considering latencies
+  const hostLatency = hostData.RH || 0
+  const timeDiff = TM - hostData.TH
+  const latencyAdjustment = (RM - hostLatency) / 2
+  
+  // Adjust host seek with time difference and latency
+  const adjustedSeek = hostData.SH + timeDiff - latencyAdjustment
+  
+  return Math.max(0, adjustedSeek)
 }
 
-/**
- * Store member latency data
- */
-export async function storeMemberLatency(
-  roomCode: string, 
-  userId: string, 
-  latency: number
-): Promise<void> {
-  try {
-    const key = `${ROOM_LATENCY_PREFIX}${roomCode}`
-    const latencyData: MemberLatency = {
-      userId,
-      latency,
-      lastPing: Date.now()
-    }
-    
-    // Store in a hash for efficient access
-    await redis.hset(key, { [userId]: latencyData })
-    await redis.expire(key, ROOM_TTL)
-    
-    console.log(`Stored latency for user ${userId} in room ${roomCode}: ${latency}ms`)
-  } catch (error) {
-    console.error('Failed to store member latency:', error)
-    throw error
-  }
-}
+
+
+
+
+
+
 
 /**
- * Get member latency data
- */
-export async function getMemberLatency(roomCode: string, userId: string): Promise<number> {
-  try {
-    const key = `${ROOM_LATENCY_PREFIX}${roomCode}`
-    const latencyData = await redis.hget<MemberLatency>(key, userId)
-    
-    if (!latencyData) {
-      return 0 // Default to 0 if no latency data
-    }
-    
-    // Return 0 if data is older than 30 seconds
-    const isStale = Date.now() - latencyData.lastPing > 30000
-    return isStale ? 0 : latencyData.latency
-  } catch (error) {
-    console.error('Failed to get member latency:', error)
-    return 0
-  }
-}
-
-/**
- * Store room members data
- */
-export async function storeRoomMembers(roomCode: string, members: RoomMembers): Promise<void> {
-  try {
-    const key = `${ROOM_MEMBERS_PREFIX}${roomCode}`
-    await redis.set(key, members, { ex: ROOM_TTL })
-    
-    console.log('Stored room members:', roomCode)
-  } catch (error) {
-    console.error('Failed to store room members:', error)
-    throw error
-  }
-}
-
-/**
- * Get room members data
- */
-export async function getRoomMembers(roomCode: string): Promise<RoomMembers | null> {
-  try {
-    const key = `${ROOM_MEMBERS_PREFIX}${roomCode}`
-    const members = await redis.get<RoomMembers>(key)
-    
-    return members || null
-  } catch (error) {
-    console.error('Failed to get room members:', error)
-    return null
-  }
-}
-
-/**
- * Add member to room
- */
-export async function addRoomMember(
-  roomCode: string, 
-  userId: string, 
-  displayName: string,
-  deviceId?: string
-): Promise<void> {
-  try {
-    const currentMembers = await getRoomMembers(roomCode) || {}
-    
-    currentMembers[userId] = {
-      displayName,
-      isOnline: true,
-      lastSeen: Date.now(),
-      deviceId
-    }
-    
-    await storeRoomMembers(roomCode, currentMembers)
-  } catch (error) {
-    console.error('Failed to add room member:', error)
-    throw error
-  }
-}
-
-/**
- * Remove member from room
- */
-export async function removeRoomMember(roomCode: string, userId: string): Promise<void> {
-  try {
-    const currentMembers = await getRoomMembers(roomCode)
-    if (!currentMembers || !currentMembers[userId]) {
-      return
-    }
-    
-    delete currentMembers[userId]
-    await storeRoomMembers(roomCode, currentMembers)
-    
-    // Also remove latency data
-    const latencyKey = `${ROOM_LATENCY_PREFIX}${roomCode}`
-    await redis.hdel(latencyKey, userId)
-  } catch (error) {
-    console.error('Failed to remove room member:', error)
-    throw error
-  }
-}
-
-/**
- * Update member online status
- */
-export async function updateMemberStatus(
-  roomCode: string, 
-  userId: string, 
-  isOnline: boolean
-): Promise<void> {
-  try {
-    const currentMembers = await getRoomMembers(roomCode)
-    if (!currentMembers || !currentMembers[userId]) {
-      return
-    }
-    
-    currentMembers[userId] = {
-      ...currentMembers[userId],
-      isOnline,
-      lastSeen: Date.now()
-    }
-    
-    await storeRoomMembers(roomCode, currentMembers)
-  } catch (error) {
-    console.error('Failed to update member status:', error)
-    throw error
-  }
-}
-
-/**
- * Clean up expired room data
+ * Clean up room sync data
  */
 export async function cleanupRoomData(roomCode: string): Promise<void> {
   try {
-    const keys = [
-      `${ROOM_SYNC_PREFIX}${roomCode}`,
-      `${ROOM_MEMBERS_PREFIX}${roomCode}`,
-      `${ROOM_LATENCY_PREFIX}${roomCode}`
-    ]
-    
-    await redis.del(...keys)
+    const key = `${ROOM_SYNC_PREFIX}${roomCode}`
+    await redis.del(key)
     console.log('Cleaned up room data:', roomCode)
   } catch (error) {
     console.error('Failed to cleanup room data:', error)
@@ -314,15 +116,21 @@ export function generateRoomCode(): string {
 }
 
 /**
- * Ping latency measurement - returns timestamp for round-trip calculation
+ * Measure round trip time using ping
  */
-export function createLatencyPing(): number {
-  return Date.now()
-}
-
-/**
- * Calculate latency from ping timestamp
- */
-export function calculateLatency(pingTimestamp: number): number {
-  return Math.max(0, Date.now() - pingTimestamp)
+export async function measureRoundTripTime(): Promise<number> {
+  try {
+    const startTime = performance.now()
+    const response = await fetch('/api/rooms/ping', {
+      method: 'GET',
+      headers: { 'Cache-Control': 'no-cache' }
+    })
+    const endTime = performance.now()
+    
+    if (!response.ok) return 0
+    
+    return Math.max(0, endTime - startTime)
+  } catch {
+    return 0
+  }
 }

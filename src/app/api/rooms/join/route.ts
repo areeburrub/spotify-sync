@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { verifySession } from '@/lib/auth'
-import { addRoomMember, getRoomSyncData } from '@/lib/redis-room-sync'
 
 export async function POST(request: NextRequest) {
   try {
@@ -70,12 +69,8 @@ export async function POST(request: NextRequest) {
       })
     }
 
-    // Add member to Redis
-    await addRoomMember(room.code, user.id, user.displayName || user.email)
-
-    // Get current room sync data
-    const syncData = await getRoomSyncData(room.code)
-
+    // No Redis member tracking needed - simplified approach
+    
     return NextResponse.json({
       room: {
         id: room.id,
@@ -86,7 +81,6 @@ export async function POST(request: NextRequest) {
         createdAt: room.createdAt,
         memberCount: room.members.filter(m => m.isActive).length + (existingMember ? 0 : 1)
       },
-      syncData,
       isOwner: room.ownerId === user.id
     })
 

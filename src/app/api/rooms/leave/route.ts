@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { verifySession } from '@/lib/auth'
-import { removeRoomMember, cleanupRoomData } from '@/lib/redis-room-sync'
+import { cleanupRoomData } from '@/lib/redis-room-sync'
 
 export async function POST(request: NextRequest) {
   try {
@@ -51,8 +51,7 @@ export async function POST(request: NextRequest) {
       data: { isActive: false }
     })
 
-    // Remove from Redis
-    await removeRoomMember(room.code, user.id)
+    // No Redis member tracking needed - simplified approach
 
     // If user is the owner and there are other active members, transfer ownership
     if (room.ownerId === user.id) {
