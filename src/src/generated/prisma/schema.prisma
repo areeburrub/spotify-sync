@@ -17,17 +17,28 @@ datasource db {
 }
 
 model User {
-  id           String   @id @default(cuid())
-  email        String   @unique
-  name         String?
-  spotifyId    String   @unique
-  displayName  String?
-  image        String?
-  accessToken  String
-  refreshToken String
-  expiresAt    DateTime
-  createdAt    DateTime @default(now())
-  updatedAt    DateTime @updatedAt
+  id             String    @id @default(cuid())
+  spotifyId      String    @unique
+  email          String    @unique
+  displayName    String?
+  images         Json? // Array of Spotify image objects
+  accessToken    String // Encrypted
+  refreshToken   String // Encrypted
+  tokenExpiresAt DateTime
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  sessions       Session[]
 
   @@map("users")
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique // JWT token
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@map("sessions")
 }
