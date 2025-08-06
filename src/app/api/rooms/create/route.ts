@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { verifySession } from '@/lib/auth'
-import { generateRoomCode, storeRoomSyncData, addRoomMember } from '@/lib/redis-room-sync'
+import { generateRoomCode } from '@/lib/redis-room-sync'
 
 export async function POST(request: NextRequest) {
   try {
@@ -66,21 +66,8 @@ export async function POST(request: NextRequest) {
       }
     })
 
-    // Initialize room sync data in Redis
-    await storeRoomSyncData(roomCode, {
-      roomCode,
-      ownerId: user.id,
-      playbackState: {
-        isPlaying: false,
-        position: 0,
-        timestamp: Date.now(),
-        volume: 0.5
-      },
-      lastUpdated: Date.now()
-    })
-
-    // Add owner to Redis members
-    await addRoomMember(roomCode, user.id, user.displayName || user.email)
+    // Room sync data will be initialized when owner starts playing
+    // No need for complex Redis initialization - keep it simple
 
     return NextResponse.json({
       room: {

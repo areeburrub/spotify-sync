@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { prisma } from '@/lib/prisma'
 import { verifySession } from '@/lib/auth'
-import { getRoomMembers } from '@/lib/redis-room-sync'
 
 export async function GET(
   request: NextRequest,
@@ -53,9 +52,6 @@ export async function GET(
       return NextResponse.json({ error: 'Access denied' }, { status: 403 })
     }
 
-    // Get online members from Redis
-    const onlineMembers = await getRoomMembers(room.code)
-
     return NextResponse.json({
       room: {
         id: room.id,
@@ -70,8 +66,8 @@ export async function GET(
         id: member.id,
         user: member.user,
         joinedAt: member.joinedAt,
-        isOnline: onlineMembers?.[member.userId]?.isOnline || false,
-        lastSeen: onlineMembers?.[member.userId]?.lastSeen
+        isOnline: true, // Simplified - assume all members are online
+        lastSeen: new Date().toISOString()
       })),
       isOwner,
       isMember: true

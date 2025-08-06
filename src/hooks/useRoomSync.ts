@@ -1,30 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { useLatencySync } from './useLatencySync'
-
-interface Track {
-  uri: string
-  id: string
-  name: string
-  artist: string
-  duration: number
-}
-
-interface PlaybackState {
-  isPlaying: boolean
-  position: number
-  timestamp: number
-  volume: number
-}
-
-interface RoomSyncData {
-  roomCode: string
-  ownerId: string
-  currentTrack?: Track
-  playbackState: PlaybackState
-  lastUpdated: number
-  syncedPosition?: number
-  userLatency?: number
-}
+import { measureRoundTripTime, calculateMemberSeek } from '@/lib/redis-room-sync'
 
 interface RoomSyncHookProps {
   roomCode: string | null
@@ -33,212 +8,144 @@ interface RoomSyncHookProps {
 }
 
 const SYNC_INTERVAL = 1000 // 1 second
-const POSITION_TOLERANCE = 2000 // 2 seconds tolerance for sync
+const SYNC_TOLERANCE = 1000 // 1 second tolerance for sync
 
 export function useRoomSync({ roomCode, isOwner, player }: RoomSyncHookProps) {
-  const [syncData, setSyncData] = useState<RoomSyncData | null>(null)
   const [isConnected, setIsConnected] = useState(false)
   const [lastSyncTime, setLastSyncTime] = useState<number>(0)
   const [syncErrors, setSyncErrors] = useState<string[]>([])
+  const [RH, setRH] = useState<number>(0) // Host round trip time
+  const [RM, setRM] = useState<number>(0) // Member round trip time
   
   const syncIntervalRef = useRef<NodeJS.Timeout | null>(null)
-  const lastKnownPositionRef = useRef<number>(0)
   const isSyncingRef = useRef<boolean>(false)
-  
-  // Use latency monitoring
-  const latencySync = useLatencySync(roomCode)
 
-  // Fetch current sync data from server
-  const fetchSyncData = useCallback(async (): Promise<RoomSyncData | null> => {
-    if (!roomCode) return null
-
+  // Measure round trip time periodically
+  const updateRoundTripTime = useCallback(async () => {
     try {
-      const response = await fetch(`/api/rooms/sync?code=${roomCode}`)
-      if (!response.ok) {
-        throw new Error('Failed to fetch sync data')
+      const roundTripTime = await measureRoundTripTime()
+      if (isOwner) {
+        setRH(roundTripTime)
+      } else {
+        setRM(roundTripTime)
       }
+    } catch (error) {
+      console.warn('Failed to measure round trip time:', error)
+    }
+  }, [isOwner])
+
+  // Owner: Send SH, TH, RH every second
+  const sendHostSyncData = useCallback(async () => {
+    if (!roomCode || !isOwner || !player) return
+
+    try {
+      const state = await player.getCurrentState()
+      if (!state) return
+
+      // SH = Host seek, TH = Host time (auto set in API), RH = Host round trip time
+      await fetch('/api/rooms/sync', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          roomCode,
+          SH: state.position,
+          isPlaying: !state.paused,
+          RH: RH
+        }),
+      })
       
-      const data = await response.json()
-      return data
+      setLastSyncTime(Date.now())
     } catch (error) {
-      console.error('Failed to fetch sync data:', error)
-      setSyncErrors(prev => [...prev.slice(-4), `Fetch error: ${error}`])
-      return null
+      console.error('Failed to send host sync data:', error)
+      setSyncErrors(prev => [...prev.slice(-4), `Send error: ${error}`])
     }
-  }, [roomCode])
+  }, [roomCode, isOwner, player, RH])
 
-  // Update server with current playback state (owner only)
-  const updateServerPlayback = useCallback(async (
-    position: number, 
-    isPlaying: boolean, 
-    timestamp?: number
-  ) => {
-    if (!roomCode || !isOwner) return
-
-    try {
-      await fetch('/api/rooms/sync', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          roomCode,
-          action: 'updatePlayback',
-          position,
-          isPlaying,
-          timestamp: timestamp || Date.now()
-        }),
-      })
-    } catch (error) {
-      console.error('Failed to update server playback:', error)
-      setSyncErrors(prev => [...prev.slice(-4), `Update error: ${error}`])
-    }
-  }, [roomCode, isOwner])
-
-  // Update server with current track (owner only)
-  const updateServerTrack = useCallback(async (track: any) => {
-    if (!roomCode || !isOwner) return
-
-    try {
-      await fetch('/api/rooms/sync', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          roomCode,
-          action: 'updateTrack',
-          track
-        }),
-      })
-    } catch (error) {
-      console.error('Failed to update server track:', error)
-      setSyncErrors(prev => [...prev.slice(-4), `Track update error: ${error}`])
-    }
-  }, [roomCode, isOwner])
-
-  // Sync member's playback to owner's state
-  const syncToOwner = useCallback(async (targetData: RoomSyncData) => {
-    if (!player || isOwner || isSyncingRef.current) return
+  // Member: Get host data and calculate own SM, TM, RM then adjust
+  const syncToHost = useCallback(async () => {
+    if (!roomCode || isOwner || !player || isSyncingRef.current) return
 
     isSyncingRef.current = true
     
     try {
+      const response = await fetch(`/api/rooms/sync?code=${roomCode}`)
+      if (!response.ok) {
+        isSyncingRef.current = false
+        return
+      }
+
+      const hostData = await response.json() // Contains SH, TH, RH, isPlaying
+      
       const currentState = await player.getCurrentState()
       if (!currentState) {
         isSyncingRef.current = false
         return
       }
 
-      const { syncedPosition = 0 } = targetData
-      const currentPosition = currentState.position
-      const positionDiff = Math.abs(currentPosition - syncedPosition)
+      // Member's own data
+      const SM = currentState.position  // Member seek
+      const TM = Date.now()            // Member time
+      // RM already measured and stored in state
+
+      // Calculate target seek using host data and member data
+      const targetSeek = calculateMemberSeek(hostData, TM, RM)
+
+      // Check if sync is needed
+      const seekDiff = Math.abs(SM - targetSeek)
       
-      // Only sync if difference is significant
-      if (positionDiff > POSITION_TOLERANCE) {
-        console.log(`Syncing position: ${currentPosition} -> ${syncedPosition} (diff: ${positionDiff}ms)`)
-        await player.seek(syncedPosition)
+      if (seekDiff > SYNC_TOLERANCE) {
+        console.log(`Syncing: SM=${SM}ms -> target=${targetSeek}ms (diff: ${seekDiff}ms)`)
+        await player.seek(targetSeek)
       }
 
       // Sync play/pause state
-      if (currentState.paused !== !targetData.playbackState.isPlaying) {
-        if (targetData.playbackState.isPlaying && currentState.paused) {
+      if (currentState.paused !== !hostData.isPlaying) {
+        if (hostData.isPlaying && currentState.paused) {
           await player.resume()
-        } else if (!targetData.playbackState.isPlaying && !currentState.paused) {
+        } else if (!hostData.isPlaying && !currentState.paused) {
           await player.pause()
         }
-      }
-
-      // Sync track if different
-      if (targetData.currentTrack && 
-          currentState.track_window.current_track.uri !== targetData.currentTrack.uri) {
-        // Note: We can't directly change tracks through Web Playback SDK
-        // This would need to be handled through Web API
-        console.log('Track change detected, but cannot change tracks via Web Playback SDK')
       }
 
       setLastSyncTime(Date.now())
       
     } catch (error) {
-      console.error('Failed to sync to owner:', error)
+      console.error('Failed to sync to host:', error)
       setSyncErrors(prev => [...prev.slice(-4), `Sync error: ${error}`])
     } finally {
       isSyncingRef.current = false
     }
-  }, [player, isOwner])
-
-  // Broadcast owner's state to server
-  const broadcastOwnerState = useCallback(async () => {
-    if (!player || !isOwner) return
-
-    try {
-      const state = await player.getCurrentState()
-      if (!state) return
-
-      const currentPosition = state.position
-      const isPlaying = !state.paused
-      const now = Date.now()
-
-      // Only update if position has changed significantly or play state changed
-      const positionDiff = Math.abs(currentPosition - lastKnownPositionRef.current)
-      if (positionDiff > 1000 || isPlaying !== syncData?.playbackState.isPlaying) {
-        await updateServerPlayback(currentPosition, isPlaying, now)
-        lastKnownPositionRef.current = currentPosition
-      }
-
-    } catch (error) {
-      console.error('Failed to broadcast owner state:', error)
-      setSyncErrors(prev => [...prev.slice(-4), `Broadcast error: ${error}`])
-    }
-  }, [player, isOwner, updateServerPlayback, syncData])
+  }, [roomCode, isOwner, player, RM])
 
   // Main sync loop
   const performSync = useCallback(async () => {
     if (!roomCode) return
 
-    const data = await fetchSyncData()
-    if (!data) return
-
-    setSyncData(data)
     setIsConnected(true)
 
     if (isOwner) {
-      // Owner broadcasts their state
-      await broadcastOwnerState()
+      // Host sends SH, TH, RH every second
+      await sendHostSyncData()
     } else {
-      // Members sync to owner's state
-      await syncToOwner(data)
+      // Members read SH, TH, RH and calculate with their SM, TM, RM
+      await syncToHost()
     }
-  }, [roomCode, isOwner, fetchSyncData, broadcastOwnerState, syncToOwner])
+  }, [roomCode, isOwner, sendHostSyncData, syncToHost])
 
-  // Handle player state changes (owner only)
+  // Measure round trip time periodically
   useEffect(() => {
-    if (!player || !isOwner) return
+    if (!roomCode) return
 
-    const handleStateChange = async (state: any | null) => {
-      if (!state || !roomCode) return
-
-      try {
-        // Update server with new state
-        await updateServerPlayback(state.position, !state.paused)
-        
-        // Update track if changed
-        const currentTrack = state.track_window.current_track
-        if (currentTrack && (!syncData?.currentTrack || 
-            syncData.currentTrack.uri !== currentTrack.uri)) {
-          await updateServerTrack(currentTrack)
-        }
-      } catch (error) {
-        console.error('Failed to handle state change:', error)
-      }
-    }
-
-    player.addListener('player_state_changed', handleStateChange)
-
-    return () => {
-      player.removeListener('player_state_changed', handleStateChange)
-    }
-  }, [player, isOwner, roomCode, updateServerPlayback, updateServerTrack, syncData])
+    // Initial measurement
+    updateRoundTripTime()
+    
+    // Update every 5 seconds
+    const latencyInterval = setInterval(updateRoundTripTime, 5000)
+    
+    return () => clearInterval(latencyInterval)
+  }, [roomCode, updateRoundTripTime])
 
   // Start/stop sync loop
   useEffect(() => {
@@ -248,7 +155,6 @@ export function useRoomSync({ roomCode, isOwner, player }: RoomSyncHookProps) {
         syncIntervalRef.current = null
       }
       setIsConnected(false)
-      setSyncData(null)
       return
     }
 
@@ -276,11 +182,12 @@ export function useRoomSync({ roomCode, isOwner, player }: RoomSyncHookProps) {
   }, [])
 
   return {
-    syncData,
     isConnected,
     lastSyncTime,
     syncErrors,
-    latencyInfo: latencySync,
+    latencyInfo: {
+      currentLatency: isOwner ? RH : RM
+    },
     manualSync: performSync,
     clearErrors: () => setSyncErrors([])
   }
