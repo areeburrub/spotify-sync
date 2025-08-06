@@ -60,39 +60,57 @@ export async function getHostSyncDataClient(roomCode: string): Promise<HostSyncD
 
 /**
  * Calculate member's adjusted seek based on host data and member timing
- * Enhanced with jitter smoothing and clock drift compensation
+ * Fixed audio sync logic with proper latency compensation
  */
 export function calculateMemberSeekClient(
   hostData: HostSyncData,
   TM: number, // Member's current time 
   RM: number, // Member's round trip time
-  previousSeeks: number[] = [] // For jitter smoothing
+  previousSeeks: number[] = [], // For jitter smoothing
+  audioLatency: number = 150 // Audio system latency (ms)
 ): number {
   if (!hostData.isPlaying) {
     return hostData.SH
   }
   
-  // Calculate time difference considering latencies
-  const hostLatency = hostData.RH || 0
-  const timeDiff = TM - hostData.TH
-  const latencyAdjustment = (RM - hostLatency) / 2
+  // Step 1: Calculate how much time has passed since host sent the data
+  const timeSinceHostUpdate = TM - hostData.TH
   
-  // Basic seek calculation
-  const rawSeek = hostData.SH + timeDiff - latencyAdjustment
+  // Step 2: Account for network delays in the sync chain
+  // Host: RH is round-trip time to write to Redis (use half for write latency)
+  const hostWriteDelay = (hostData.RH || 0) / 2 // Host's write delay to Redis
   
-  // Jitter smoothing: Use weighted average of recent seeks
+  // Member: RM is full round-trip time to read from Redis (use full RM for read latency)
+  const memberReadDelay = RM // Member's full read delay from Redis
+  
+  // Step 3: Calculate the total time difference accounting for:
+  // - Time elapsed since host update
+  // - Host's delay writing to Redis (subtract - data was written earlier)
+  // - Member's delay reading from Redis (add - data is stale by this amount)
+  // - Audio system latency (add - audio takes time to play)
+  const totalDelay = timeSinceHostUpdate - hostWriteDelay + memberReadDelay + audioLatency
+  
+  // Step 4: Calculate target seek position
+  const rawSeek = hostData.SH + totalDelay
+  
+  // Step 5: Jitter smoothing for stable playback
   if (previousSeeks.length > 0) {
     const recentSeeks = previousSeeks.slice(-3) // Last 3 seeks
-    const weights = [0.1, 0.3, 0.6] // More weight to recent values
+    const weights = [0.2, 0.3, 0.5] // Exponential weighting
     
-    let smoothedSeek = rawSeek * 0.7 // 70% current calculation
+    let smoothedSeek = rawSeek * 0.6 // 60% current calculation
     recentSeeks.forEach((seek, i) => {
-      smoothedSeek += seek * (weights[i] || 0.1) * 0.3 // 30% historical
+      const weight = weights[i] || 0.1
+      smoothedSeek += seek * weight * 0.4 // 40% historical
     })
+    
+    // Debug logging
+    console.log(`[Sync] Raw: ${rawSeek.toFixed(1)}ms, Smoothed: ${smoothedSeek.toFixed(1)}ms, NetDelay: hostWrite=${hostWriteDelay.toFixed(1)}ms memberRead=${memberReadDelay.toFixed(1)}ms, Audio: ${audioLatency}ms`)
     
     return Math.max(0, smoothedSeek)
   }
   
+  console.log(`[Sync] Raw seek: ${rawSeek.toFixed(1)}ms, Total delay: ${totalDelay.toFixed(1)}ms, hostWrite: ${hostWriteDelay.toFixed(1)}ms, memberRead: ${memberReadDelay.toFixed(1)}ms`)
   return Math.max(0, rawSeek)
 }
 
@@ -114,6 +132,44 @@ export function getAdaptiveSyncTolerance(RM: number, RH: number): number {
   
   // Minimum 500ms, maximum 5000ms tolerance
   return Math.min(Math.max(tolerance, 500), 5000)
+}
+
+/**
+ * Estimate browser audio system latency
+ */
+export function estimateAudioLatency(): number {
+  try {
+    // Check for AudioContext with proper TypeScript compatibility
+    const AudioContextClass = (typeof AudioContext !== 'undefined') 
+      ? AudioContext 
+      : (typeof window !== 'undefined' && (window as any).webkitAudioContext) 
+        ? (window as any).webkitAudioContext 
+        : null
+    
+    if (AudioContextClass) {
+      const tempContext = new AudioContextClass()
+      
+      // Use properties that are actually available (based on Web Audio API docs)
+      // Note: outputLatency is missing in Chrome, baseLatency may not be available
+      const baseLatency = (tempContext as any).baseLatency || 0
+      const outputLatency = (tempContext as any).outputLatency || 0
+      
+      tempContext.close()
+      
+      // Convert to milliseconds and add typical browser/Spotify SDK overhead
+      const measuredLatency = (baseLatency + outputLatency) * 1000
+      const audioLatency = measuredLatency > 0 ? measuredLatency + 100 : 150 // +100ms for Spotify SDK or fallback
+      
+      console.log(`[Audio] Estimated latency: ${audioLatency.toFixed(1)}ms (base: ${(baseLatency*1000).toFixed(1)}ms, output: ${(outputLatency*1000).toFixed(1)}ms)`)
+      return Math.max(50, Math.min(audioLatency, 500)) // Clamp between 50-500ms
+    }
+  } catch (error) {
+    console.warn('[Audio] Could not estimate audio latency:', error)
+  }
+  
+  // Fallback: typical web audio latency based on research
+  // Most browsers: 100-200ms, Spotify Web Playback SDK adds ~50-100ms
+  return 150
 }
 
 /**

@@ -4,7 +4,8 @@ import {
   getHostSyncDataClient, 
   calculateMemberSeekClient, 
   measureRoundTripTimeClient,
-  getAdaptiveSyncTolerance
+  getAdaptiveSyncTolerance,
+  estimateAudioLatency
 } from '@/lib/redis-client'
 
 interface RoomSyncHookProps {
@@ -22,6 +23,7 @@ export function useRoomSync({ roomCode, isOwner, player }: RoomSyncHookProps) {
   const [syncErrors, setSyncErrors] = useState<string[]>([])
   const [RH, setRH] = useState<number>(0) // Host round trip time
   const [RM, setRM] = useState<number>(0) // Member round trip time
+  const [audioLatency, setAudioLatency] = useState<number>(150) // Audio system latency
   
   const syncIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const isSyncingRef = useRef<boolean>(false)
@@ -91,8 +93,8 @@ export function useRoomSync({ roomCode, isOwner, player }: RoomSyncHookProps) {
       const TM = Date.now()            // Member time
       // RM already measured and stored in state
 
-      // Calculate target seek using host data and member data - CLIENT-SIDE CALCULATION
-      const targetSeek = calculateMemberSeekClient(hostData, TM, RM, previousSeeksRef.current)
+      // Calculate target seek using host data and member data - CORRECTED AUDIO SYNC LOGIC
+      const targetSeek = calculateMemberSeekClient(hostData, TM, RM, previousSeeksRef.current, audioLatency)
       
       // Update seek history for jitter smoothing
       previousSeeksRef.current.push(targetSeek)
@@ -105,7 +107,7 @@ export function useRoomSync({ roomCode, isOwner, player }: RoomSyncHookProps) {
       const seekDiff = Math.abs(SM - targetSeek)
       
       if (seekDiff > adaptiveTolerance) {
-        console.log(`[Member] Syncing: SM=${SM}ms -> target=${targetSeek}ms (diff: ${seekDiff}ms, tolerance=${adaptiveTolerance}ms, RM=${RM.toFixed(1)}ms)`)
+        console.log(`[Member] Syncing: SM=${SM}ms -> target=${targetSeek}ms (diff: ${seekDiff}ms, tolerance=${adaptiveTolerance}ms, netLatency=${RM.toFixed(1)}ms, audioLatency=${audioLatency}ms)`)
         await player.seek(targetSeek)
       }
 
@@ -143,14 +145,18 @@ export function useRoomSync({ roomCode, isOwner, player }: RoomSyncHookProps) {
     }
   }, [roomCode, isOwner, sendHostSyncData, syncToHost])
 
-  // Measure round trip time periodically - DIRECT REDIS
+  // Measure round trip time and audio latency periodically - DIRECT REDIS
   useEffect(() => {
     if (!roomCode) return
 
-    // Initial measurement
+    // Initial measurements
     updateRoundTripTime()
     
-    // Update every 1 second
+    // Measure audio latency once (it's relatively stable)
+    const measuredAudioLatency = estimateAudioLatency()
+    setAudioLatency(measuredAudioLatency)
+    
+    // Update network latency every 1 second
     const latencyInterval = setInterval(updateRoundTripTime, 1000)
     
     return () => clearInterval(latencyInterval)
