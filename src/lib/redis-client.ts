@@ -88,7 +88,7 @@ export function calculateMemberSeekClient(
   // - Host's delay writing to Redis (subtract - data was written earlier)
   // - Member's delay reading from Redis (add - data is stale by this amount)
   // - Audio system latency (add - audio takes time to play)
-  const totalDelay = timeSinceHostUpdate - hostWriteDelay + memberReadDelay + audioLatency
+  const totalDelay = timeSinceHostUpdate - (hostWriteDelay + memberReadDelay)
   
   // Step 4: Calculate target seek position
   const rawSeek = hostData.SH + totalDelay
