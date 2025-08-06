@@ -10,8 +10,8 @@ interface HostSyncData {
 
 // Initialize Redis client (reuse from oauth store)
 const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL!,
-  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+  url: process.env.NEXT_PUBLIC_UPSTASH_REDIS_REST_URL!,
+  token: process.env.NEXT_PUBLIC_UPSTASH_REDIS_REST_TOKEN!,
 })
 
 const ROOM_SYNC_PREFIX = 'room:sync:'
@@ -86,12 +86,6 @@ export function calculateMemberSeek(
   
   return Math.max(0, adjustedSeek)
 }
-
-
-
-
-
-
 
 
 /**

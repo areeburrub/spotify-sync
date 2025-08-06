@@ -1,5 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { measureRoundTripTime, calculateMemberSeek } from '@/lib/redis-room-sync'
+import { 
+  storeHostSyncDataClient, 
+  getHostSyncDataClient, 
+  calculateMemberSeekClient, 
+  measureRoundTripTimeClient,
+  getAdaptiveSyncTolerance
+} from '@/lib/redis-client'
 
 interface RoomSyncHookProps {
   roomCode: string | null
@@ -19,22 +25,24 @@ export function useRoomSync({ roomCode, isOwner, player }: RoomSyncHookProps) {
   
   const syncIntervalRef = useRef<NodeJS.Timeout | null>(null)
   const isSyncingRef = useRef<boolean>(false)
+  const previousSeeksRef = useRef<number[]>([]) // For jitter smoothing
 
-  // Measure round trip time periodically
+  // Measure round trip time periodically - DIRECT REDIS CALL
   const updateRoundTripTime = useCallback(async () => {
     try {
-      const roundTripTime = await measureRoundTripTime()
+      const roundTripTime = await measureRoundTripTimeClient()
       if (isOwner) {
         setRH(roundTripTime)
       } else {
         setRM(roundTripTime)
       }
+      console.log(`[${isOwner ? 'Host' : 'Member'}] RTT: ${roundTripTime.toFixed(1)}ms`)
     } catch (error) {
       console.warn('Failed to measure round trip time:', error)
     }
   }, [isOwner])
 
-  // Owner: Send SH, TH, RH every second
+  // Owner: Send SH, TH, RH every second - DIRECT REDIS CALL
   const sendHostSyncData = useCallback(async () => {
     if (!roomCode || !isOwner || !player) return
 
@@ -42,42 +50,36 @@ export function useRoomSync({ roomCode, isOwner, player }: RoomSyncHookProps) {
       const state = await player.getCurrentState()
       if (!state) return
 
-      // SH = Host seek, TH = Host time (auto set in API), RH = Host round trip time
-      await fetch('/api/rooms/sync', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          roomCode,
-          SH: state.position,
-          isPlaying: !state.paused,
-          RH: RH
-        }),
-      })
+      // DIRECT REDIS WRITE - NO API ROUTE
+      await storeHostSyncDataClient(
+        roomCode,
+        state.position, // SH
+        !state.paused,  // isPlaying
+        RH              // RH
+      )
       
       setLastSyncTime(Date.now())
+      console.log(`[Host] Synced: SH=${state.position}ms, RH=${RH.toFixed(1)}ms`)
     } catch (error) {
       console.error('Failed to send host sync data:', error)
       setSyncErrors(prev => [...prev.slice(-4), `Send error: ${error}`])
     }
   }, [roomCode, isOwner, player, RH])
 
-  // Member: Get host data and calculate own SM, TM, RM then adjust
+  // Member: Get host data and calculate own SM, TM, RM then adjust - DIRECT REDIS CALL
   const syncToHost = useCallback(async () => {
     if (!roomCode || isOwner || !player || isSyncingRef.current) return
 
     isSyncingRef.current = true
     
     try {
-      const response = await fetch(`/api/rooms/sync?code=${roomCode}`)
-      if (!response.ok) {
+      // DIRECT REDIS READ - NO API ROUTE
+      const hostData = await getHostSyncDataClient(roomCode)
+      if (!hostData) {
         isSyncingRef.current = false
         return
       }
 
-      const hostData = await response.json() // Contains SH, TH, RH, isPlaying
-      
       const currentState = await player.getCurrentState()
       if (!currentState) {
         isSyncingRef.current = false
@@ -89,14 +91,21 @@ export function useRoomSync({ roomCode, isOwner, player }: RoomSyncHookProps) {
       const TM = Date.now()            // Member time
       // RM already measured and stored in state
 
-      // Calculate target seek using host data and member data
-      const targetSeek = calculateMemberSeek(hostData, TM, RM)
+      // Calculate target seek using host data and member data - CLIENT-SIDE CALCULATION
+      const targetSeek = calculateMemberSeekClient(hostData, TM, RM, previousSeeksRef.current)
+      
+      // Update seek history for jitter smoothing
+      previousSeeksRef.current.push(targetSeek)
+      if (previousSeeksRef.current.length > 5) {
+        previousSeeksRef.current.shift() // Keep last 5 seeks
+      }
 
-      // Check if sync is needed
+      // Use adaptive sync tolerance based on network conditions
+      const adaptiveTolerance = getAdaptiveSyncTolerance(RM, hostData.RH || 0)
       const seekDiff = Math.abs(SM - targetSeek)
       
-      if (seekDiff > SYNC_TOLERANCE) {
-        console.log(`Syncing: SM=${SM}ms -> target=${targetSeek}ms (diff: ${seekDiff}ms)`)
+      if (seekDiff > adaptiveTolerance) {
+        console.log(`[Member] Syncing: SM=${SM}ms -> target=${targetSeek}ms (diff: ${seekDiff}ms, tolerance=${adaptiveTolerance}ms, RM=${RM.toFixed(1)}ms)`)
         await player.seek(targetSeek)
       }
 
@@ -119,30 +128,30 @@ export function useRoomSync({ roomCode, isOwner, player }: RoomSyncHookProps) {
     }
   }, [roomCode, isOwner, player, RM])
 
-  // Main sync loop
+  // Main sync loop - NO NETWORK REQUESTS, DIRECT REDIS
   const performSync = useCallback(async () => {
     if (!roomCode) return
 
     setIsConnected(true)
 
     if (isOwner) {
-      // Host sends SH, TH, RH every second
+      // Host sends SH, TH, RH every second - DIRECT REDIS
       await sendHostSyncData()
     } else {
-      // Members read SH, TH, RH and calculate with their SM, TM, RM
+      // Members read SH, TH, RH and calculate with their SM, TM, RM - DIRECT REDIS
       await syncToHost()
     }
   }, [roomCode, isOwner, sendHostSyncData, syncToHost])
 
-  // Measure round trip time periodically
+  // Measure round trip time periodically - DIRECT REDIS
   useEffect(() => {
     if (!roomCode) return
 
     // Initial measurement
     updateRoundTripTime()
     
-    // Update every 5 seconds
-    const latencyInterval = setInterval(updateRoundTripTime, 5000)
+    // Update every 1 second
+    const latencyInterval = setInterval(updateRoundTripTime, 1000)
     
     return () => clearInterval(latencyInterval)
   }, [roomCode, updateRoundTripTime])
